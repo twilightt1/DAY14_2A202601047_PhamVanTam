@@ -25,6 +25,28 @@ from openai import OpenAI, OpenAIError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
+
+# The lab network's internal DNS cannot resolve openrouter.ai for this
+# process, so pin the API host to the Cloudflare edge IP resolved by the
+# public DNS for openrouter.ai. The OpenRouter API is served on the base
+# domain (OPENAI_BASE_URL in .env); both edge IPs answer 200.
+_OPENROUTER_PINS = [
+    ip.strip()
+    for ip in os.getenv("OPENROUTER_PIN_IP", "104.18.2.115,104.18.3.115").split(",")
+    if ip.strip()
+]
+if os.getenv("OPENROUTER_USE_PIN", "1") == "1":
+    import socket as _socket
+
+    _real_getaddrinfo = _socket.getaddrinfo
+
+    def _pinned_getaddrinfo(host, port, *args, **kwargs):
+        if host == "openrouter.ai":
+            return _real_getaddrinfo(_OPENROUTER_PINS[0], port, *args, **kwargs)
+        return _real_getaddrinfo(host, port, *args, **kwargs)
+
+    _socket.getaddrinfo = _pinned_getaddrinfo
+
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
 STOPWORD_TEXT = (
@@ -243,27 +265,35 @@ class TextGenerator(Protocol):
 
 
 class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
+    def __init__(self, max_output_tokens: int = 4096) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        last_error: Exception | None = None
+        for attempt in range(6):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                )
+                answer = (response.choices[0].message.content or "").strip()
+                if answer:
+                    return answer
+                last_error = RuntimeError("OpenAI returned an empty answer")
+            except Exception as exc:
+                last_error = exc
+            time.sleep(2.0 * (attempt + 1))
+        raise RuntimeError(f"OpenAI generation failed after 6 attempts: {last_error}")
 
 
 @dataclass(frozen=True)
